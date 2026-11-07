@@ -9,6 +9,13 @@
 #include "kern_xe_data_access.hpp"
 #include "kern_backlight_profile.hpp"
 #include <Headers/kern_api.hpp>
+#include <kern/thread.h>
+#include <mach/vm_prot.h>
+#include <sys/proc.h>
+#include <libkern/libkern.h>
+#include <kern/kern_types.h>
+extern "C" kern_return_t kernel_thread_start(void (*)(void *, wait_result_t), void *, thread_t *);
+extern "C" void thread_deallocate(thread_t);
 #include <Headers/kern_iokit.hpp>
 #include <IOKit/pci/IOPCIDevice.h>
 static size_t hostInstructionSize(const uint8_t *bytes,size_t length) {
@@ -34,6 +41,99 @@ static const char *backlightPath[] { "/System/Library/Extensions/AppleBacklight.
 static KernelPatcher::KextInfo backlight { "com.apple.driver.AppleBacklight",backlightPath,arrsize(backlightPath),{true},{},KernelPatcher::KextInfo::Unloaded };
 static const char *surfacePath[] { "/System/Library/Extensions/IOSurface.kext/Contents/MacOS/IOSurface" };
 static KernelPatcher::KextInfo surface { "com.apple.iokit.IOSurface",surfacePath,arrsize(surfacePath),{true},{},KernelPatcher::KextInfo::Unloaded };
+// Local fix: the Tiger Lake Metal driver allocates a 0x12010-byte block per command
+// buffer when its queue has no shared block, then skips freeing it for the only-active
+// buffer, leaking about 96 KiB per submission. Applied to validated pages only, so
+// the on-disk file and its signature stay untouched.
+static mach_vm_address_t orgMmap {};
+using t_machVmProtect=kern_return_t (*)(vm_map_t,mach_vm_offset_t,mach_vm_size_t,boolean_t,vm_prot_t);
+using t_currentMap=vm_map_t (*)();
+static t_machVmProtect fixVmProtect {};
+static t_currentMap fixCurrentMap {};
+static bool mtlFixAllProcesses {};
+static const uint8_t mtlFreeJumpPage[] {
+ 0x00,0x00,0x48,0x8b,0x1d,0x3e,0xb1,0x41,0x00,0x49,0x8b,0x3c,0x1e,0x48,0x85,0xff,
+ 0x74,0x1b,0x48,0x8b,0x05,0x26,0xb1,0x41,0x00,0x41,0x80,0x3c,0x06,0x00,0x75,0x0d};
+static constexpr uint64_t mtlFreeJumpFileOffset {0x7ed69};
+static volatile uint64_t mtlFixExecMaps,mtlFixMatches,mtlFixWrites,mtlFixFailures,mtlFixFinder,mtlFixWindowServer;
+static int wrapMmap(void *proc, void *args, uint64_t *retval) {
+ int err=FunctionCast(wrapMmap,orgMmap)(proc,args,retval);
+ if(err||!retval)return err;
+ auto bytes=static_cast<const uint8_t *>(args);
+ const uint64_t len=*reinterpret_cast<const uint64_t *>(bytes+0x8);
+ const int prot=*reinterpret_cast<const int *>(bytes+0x10);
+ const uint64_t pos=*reinterpret_cast<const uint64_t *>(bytes+0x28);
+ if(!(prot&VM_PROT_EXECUTE)||pos!=0||len<mtlFreeJumpFileOffset+sizeof(mtlFreeJumpPage))return err;
+ __atomic_add_fetch(&mtlFixExecMaps,1,__ATOMIC_RELAXED);
+ char name[32] {};
+ proc_selfname(name,sizeof(name));
+ const bool isFinder=!strcmp(name,"Finder"),isWS=!strcmp(name,"WindowServer");
+ if(!mtlFixAllProcesses&&!isFinder&&strcmp(name,"leak")&&strcmp(name,"bytes"))return err;
+ const uint64_t spot=*retval+mtlFreeJumpFileOffset;
+ uint8_t current[sizeof(mtlFreeJumpPage)];
+ if(copyin(spot,current,sizeof(current))||memcmp(current,mtlFreeJumpPage,sizeof(current)))return err;
+ __atomic_add_fetch(&mtlFixMatches,1,__ATOMIC_RELAXED);
+ const uint64_t jump=spot+30,page=jump&~static_cast<uint64_t>(PAGE_SIZE-1);
+ const uint8_t nops[2] {0x90,0x90};
+ auto map=fixCurrentMap();
+ if(fixVmProtect(map,page,PAGE_SIZE,FALSE,VM_PROT_READ|VM_PROT_WRITE|VM_PROT_COPY)!=KERN_SUCCESS) {
+  __atomic_add_fetch(&mtlFixFailures,1,__ATOMIC_RELAXED);
+  return err;
+ }
+ const int wrote=copyout(nops,jump,sizeof(nops));
+ if(fixVmProtect(map,page,PAGE_SIZE,FALSE,VM_PROT_READ|VM_PROT_EXECUTE)!=KERN_SUCCESS||wrote)
+  __atomic_add_fetch(&mtlFixFailures,1,__ATOMIC_RELAXED);
+ else {
+  __atomic_add_fetch(&mtlFixWrites,1,__ATOMIC_RELAXED);
+  if(isFinder)__atomic_add_fetch(&mtlFixFinder,1,__ATOMIC_RELAXED);
+  if(isWS)__atomic_add_fetch(&mtlFixWindowServer,1,__ATOMIC_RELAXED);
+ }
+ return err;
+}
+static void mtlFixPublisher(void *, wait_result_t) {
+ for(;;) {
+  IOSleep(5000);
+  auto root=IORegistryEntry::getRegistryRoot();
+  root->setProperty("TGLMetalFixExecMaps",mtlFixExecMaps,64);
+  root->setProperty("TGLMetalFixMatches",mtlFixMatches,64);
+  root->setProperty("TGLMetalFixWrites",mtlFixWrites,64);
+  root->setProperty("TGLMetalFixFailures",mtlFixFailures,64);
+  root->setProperty("TGLMetalFixFinder",mtlFixFinder,64);
+  root->setProperty("TGLMetalFixWindowServer",mtlFixWindowServer,64);
+ }
+}
+
+// Real GPU load (-wex-gpu-load). The donor driver leaves "Device Utilization %" at 0,
+// but the RC6 residency counter (0x138108, 1.28 us units) advances: time not spent in
+// RC6 is busy time. Read-only; published as WEXGPUBusyPercent/WEXGPUBusySamples.
+static void gpuLoadThread(void *arg, wait_result_t) {
+ auto gpu=static_cast<IOPCIDevice *>(arg);
+ auto root=IORegistryEntry::getRegistryRoot();
+ IOSleep(30000); // let framebuffer startup finish
+ auto map=gpu->mapDeviceMemoryWithRegister(0x10,kIOMapReadOnly|kIOMapInhibitCache);
+ if(!map)return;
+ auto rc6=reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress()+0x138108);
+ uint32_t lastCount=*rc6;
+ uint64_t lastTime=0,samples=0;
+ absolutetime_to_nanoseconds(mach_absolute_time(),&lastTime);
+ for(;;) {
+  IOSleep(1000);
+  const uint32_t count=*rc6;
+  uint64_t now=0;
+  absolutetime_to_nanoseconds(mach_absolute_time(),&now);
+  const uint64_t elapsed=now-lastTime;
+  // 0xFFFFFFFF: the GPU is powered down; skip that interval.
+  if(count!=UINT32_MAX && lastCount!=UINT32_MAX && elapsed) {
+   const uint64_t idle=static_cast<uint64_t>(static_cast<uint32_t>(count-lastCount))*1280;
+   const uint64_t busy=idle>=elapsed ? 0 : (elapsed-idle)*100/elapsed;
+   root->setProperty("WEXGPUBusyPercent",busy,64);
+   root->setProperty("WEXGPUBusySamples",++samples,64);
+  }
+  lastCount=count;
+  lastTime=now;
+ }
+}
+
 void XeHost::init() {
  callbackHost=this;
  PE_parse_boot_argn("gfxrst",&resetFramebuffer,sizeof(resetFramebuffer));
@@ -48,8 +148,25 @@ void XeHost::init() {
  XeDataAccess::init();
 }
 void XeHost::processKernel(KernelPatcher &patcher) {
+ if(checkKernelArgument("-wex-mtl-fix")) {
+  mtlFixAllProcesses=checkKernelArgument("-wex-mtl-fix-ws");
+  fixVmProtect=reinterpret_cast<t_machVmProtect>(patcher.solveSymbol(KernelPatcher::KernelID,"_mach_vm_protect"));
+  fixCurrentMap=reinterpret_cast<t_currentMap>(patcher.solveSymbol(KernelPatcher::KernelID,"_current_map"));
+  KernelPatcher::RouteRequest mtlFixRoute {"_mmap",wrapMmap,orgMmap};
+  const bool routed=fixVmProtect&&fixCurrentMap&&patcher.routeMultipleLong(KernelPatcher::KernelID,&mtlFixRoute,1);
+  if(!routed)patcher.clearError();
+  IORegistryEntry::getRegistryRoot()->setProperty("TGLMetalFreeFixRouted",routed);
+  thread_t publisher {};
+  if(routed && kernel_thread_start(mtlFixPublisher,nullptr,&publisher)==KERN_SUCCESS)thread_deallocate(publisher);
+ }
  auto info=DeviceInfo::create();if(!info)return;
  auto gpu=OSDynamicCast(IOPCIDevice,info->videoBuiltin);
+ if(gpu&&checkKernelArgument("-wex-gpu-load")) {
+  thread_t load {};
+  gpu->retain();
+  if(kernel_thread_start(gpuLoadThread,gpu,&load)==KERN_SUCCESS)thread_deallocate(load);
+  else gpu->release();
+ }
  // Match WEG ordering: PCI config reads require a published IOPCIDevice.
  const bool published=gpu && WIOKit::awaitPublishing(gpu);
  const auto profile=published ? XELP::deviceProfile(gpu) : XELP::Profile {};

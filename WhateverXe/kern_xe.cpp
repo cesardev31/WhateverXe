@@ -14372,6 +14372,13 @@ bool XE::wrapTGLAcceleratorStart(IOService *that, IOService *provider) {
 	tglRecordStartOrder(6,that,9,0,0,result);
 	SYSLOG("igfx", "TGL accelerator start returned %d", result);
 	if(result && callbackXE->adlnDetected && checkKernelArgument("-wex-adln-kernel-ctx"))adlnRunKernelContextTrial(that);
+	if(result && checkKernelArgument("-wex-no-gva")) {
+		// Local stability switch: stop advertising the video path so AppleGVA finds no hardware.
+		const char *gvaKeys[] {"IOGVAScaler","IOGVACodec","IOGVABGRAEnc","IOGVAHEVCDecode",
+			"IOGVAHEVCDecodeCapabilities","IOGVAHEVCEncodeCapabilities","IODVDBundleName","IOVARendererID"};
+		for (auto key : gvaKeys) that->removeProperty(key);
+		IORegistryEntry::getRegistryRoot()->setProperty("TGLNoGVAApplied",true);
+	}
 	return result;
 }
 
