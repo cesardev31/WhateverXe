@@ -15174,6 +15174,28 @@ bool XE::installTGLCSB12(KernelPatcher &patcher,size_t index,mach_vm_address_t a
   ok=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(modeSite,modeReplace,sizeof(modeReplace));
  }
  IORegistryEntry::getRegistryRoot()->setProperty("TGLCSB12ModePatched",ok);
+ // -wex-gpgpu-tg: Gen12 requires GPGPU preemption at thread-group level
+ // (Linux v6.12 gen12_ctx_workarounds_init, WaDisableGPGPUMidThreadPreemption)
+ // and Linux never whitelists CS_CHICKEN1 on TGL. The Ice Lake donor's
+ // initModeRegisters grants user batches write access to it through
+ // FORCE_TO_NONPRIV slot 4 (0x24E0 = 0x2580), and GPU hang reports from
+ // compute clients show CS_CHICKEN1 = 1 (mid-thread). Keep the slot but make it
+ // read-only (access bits 29:28 = RD, as the donor already does for 0x2351/0x2341),
+ // so the thread-group value set by startGraphicsEngine persists.
+ if (checkKernelArgument("-wex-gpgpu-tg")) {
+  const uint8_t wlFind[] {0xC7,0x80,0xE0,0x24,0x00,0x00,0x80,0x25,0x00,0x00};
+  const uint8_t wlReplace[] {0xC7,0x80,0xE0,0x24,0x00,0x00,0x80,0x25,0x00,0x10};
+  auto wlSite=reinterpret_cast<uint8_t *>(address+0x28EEB);
+  bool wl=size>0x28EF5 && patcher.solveSymbol<mach_vm_address_t>(index,"__ZN16IntelAccelerator17initModeRegistersEv",address,size)==address+0x28E1A &&
+   !memcmp(wlSite,wlFind,sizeof(wlFind));
+  if (wl) {
+   KernelPatcher::LookupPatch wlPatch {currentGraphics,wlFind,wlReplace,sizeof(wlFind),1};
+   patcher.applyLookupPatch(&wlPatch,wlSite,sizeof(wlFind)+1);
+   wl=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(wlSite,wlReplace,sizeof(wlReplace));
+  }
+  patcher.clearError();
+  IORegistryEntry::getRegistryRoot()->setProperty("TGLGPGPUThreadGroupPatched",wl);
+ }
  // The original reset writes head/tail itself before context replay. Keep those
  // stores but change their reset value, so it cannot undo initialize() above.
  const uint8_t find[] {0xB8,7,0,0,0,0x89,0x87,4,0x1C,0,0};
