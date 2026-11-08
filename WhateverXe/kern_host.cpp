@@ -108,7 +108,11 @@ static void mtlFixPublisher(void *, wait_result_t) {
 // RC6 is busy time. Also samples the actual GT frequency every 100 ms from
 // GEN12_RPSTAT1 (0x1381B4, CAGF bits 19:11 in 50/3 MHz units; 0 while in RC6) and
 // the RP0 limit (0x145998 bits 7:0, 50 MHz units), as Linux v6.12 reads them.
-// Read-only; published as WEXGPUBusyPercent/Samples and WEXGPUFreq{,Max,Limit}MHz.
+// GT0_PERF_LIMIT_REASONS (0x1381A8, Gen11+, i915_reg.h) explains frequency limits:
+// bit0 PROCHOT, 1 thermal, 5 RATL, 6 VR thermalert, 7 VR TDC, 8 PL4, 10 PL1, 11 PL2;
+// bits 31:16 are the sticky log. WEXGPUThrottle ORs bits 11:0 seen while active.
+// Read-only; published as WEXGPUBusyPercent/Samples, WEXGPUFreq{,Max,Limit}MHz,
+// WEXGPUThrottle and WEXGPUThrottleRaw.
 static void gpuLoadThread(void *arg, wait_result_t) {
  auto gpu=static_cast<IOPCIDevice *>(arg);
  auto root=IORegistryEntry::getRegistryRoot();
@@ -118,6 +122,7 @@ static void gpuLoadThread(void *arg, wait_result_t) {
  const auto base=map->getVirtualAddress();
  auto rc6=reinterpret_cast<volatile uint32_t *>(base+0x138108);
  auto rpstat=reinterpret_cast<volatile uint32_t *>(base+0x1381B4);
+ auto limits=reinterpret_cast<volatile uint32_t *>(base+0x1381A8);
  const uint32_t caps=*reinterpret_cast<volatile uint32_t *>(base+0x145998);
  if(caps!=UINT32_MAX && (caps&0xFF))root->setProperty("WEXGPUFreqLimitMHz",static_cast<uint64_t>(caps&0xFF)*50,64);
  uint32_t lastCount=*rc6;
@@ -125,11 +130,16 @@ static void gpuLoadThread(void *arg, wait_result_t) {
  absolutetime_to_nanoseconds(mach_absolute_time(),&lastTime);
  for(;;) {
   uint64_t cagfSum=0,cagfMax=0,active=0;
+  uint32_t throttle=0,throttleRaw=0;
   for(unsigned i=0;i<10;i++) {
    IOSleep(100);
    const uint32_t v=*rpstat;
    const uint32_t cagf=v==UINT32_MAX ? 0 : (v>>11)&0x1FF;
-   if(cagf) {cagfSum+=cagf;active++;if(cagf>cagfMax)cagfMax=cagf;}
+   if(cagf) {
+    cagfSum+=cagf;active++;if(cagf>cagfMax)cagfMax=cagf;
+    const uint32_t r=*limits;
+    if(r!=UINT32_MAX) {throttle|=r&0xDE3;throttleRaw=r;}
+   }
   }
   const uint32_t count=*rc6;
   uint64_t now=0;
@@ -142,6 +152,8 @@ static void gpuLoadThread(void *arg, wait_result_t) {
    root->setProperty("WEXGPUBusyPercent",busy,64);
    root->setProperty("WEXGPUFreqMHz",active ? cagfSum*50/(3*active) : 0,64);
    root->setProperty("WEXGPUFreqMaxMHz",cagfMax*50/3,64);
+   root->setProperty("WEXGPUThrottle",throttle,32);
+   if(active)root->setProperty("WEXGPUThrottleRaw",throttleRaw,32);
    root->setProperty("WEXGPUBusySamples",++samples,64);
   }
   lastCount=count;
