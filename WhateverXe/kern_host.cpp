@@ -105,19 +105,32 @@ static void mtlFixPublisher(void *, wait_result_t) {
 
 // Real GPU load (-wex-gpu-load). The donor driver leaves "Device Utilization %" at 0,
 // but the RC6 residency counter (0x138108, 1.28 us units) advances: time not spent in
-// RC6 is busy time. Read-only; published as WEXGPUBusyPercent/WEXGPUBusySamples.
+// RC6 is busy time. Also samples the actual GT frequency every 100 ms from
+// GEN12_RPSTAT1 (0x1381B4, CAGF bits 19:11 in 50/3 MHz units; 0 while in RC6) and
+// the RP0 limit (0x145998 bits 7:0, 50 MHz units), as Linux v6.12 reads them.
+// Read-only; published as WEXGPUBusyPercent/Samples and WEXGPUFreq{,Max,Limit}MHz.
 static void gpuLoadThread(void *arg, wait_result_t) {
  auto gpu=static_cast<IOPCIDevice *>(arg);
  auto root=IORegistryEntry::getRegistryRoot();
  IOSleep(30000); // let framebuffer startup finish
  auto map=gpu->mapDeviceMemoryWithRegister(0x10,kIOMapReadOnly|kIOMapInhibitCache);
  if(!map)return;
- auto rc6=reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress()+0x138108);
+ const auto base=map->getVirtualAddress();
+ auto rc6=reinterpret_cast<volatile uint32_t *>(base+0x138108);
+ auto rpstat=reinterpret_cast<volatile uint32_t *>(base+0x1381B4);
+ const uint32_t caps=*reinterpret_cast<volatile uint32_t *>(base+0x145998);
+ if(caps!=UINT32_MAX && (caps&0xFF))root->setProperty("WEXGPUFreqLimitMHz",static_cast<uint64_t>(caps&0xFF)*50,64);
  uint32_t lastCount=*rc6;
  uint64_t lastTime=0,samples=0;
  absolutetime_to_nanoseconds(mach_absolute_time(),&lastTime);
  for(;;) {
-  IOSleep(1000);
+  uint64_t cagfSum=0,cagfMax=0,active=0;
+  for(unsigned i=0;i<10;i++) {
+   IOSleep(100);
+   const uint32_t v=*rpstat;
+   const uint32_t cagf=v==UINT32_MAX ? 0 : (v>>11)&0x1FF;
+   if(cagf) {cagfSum+=cagf;active++;if(cagf>cagfMax)cagfMax=cagf;}
+  }
   const uint32_t count=*rc6;
   uint64_t now=0;
   absolutetime_to_nanoseconds(mach_absolute_time(),&now);
@@ -127,6 +140,8 @@ static void gpuLoadThread(void *arg, wait_result_t) {
    const uint64_t idle=static_cast<uint64_t>(static_cast<uint32_t>(count-lastCount))*1280;
    const uint64_t busy=idle>=elapsed ? 0 : (elapsed-idle)*100/elapsed;
    root->setProperty("WEXGPUBusyPercent",busy,64);
+   root->setProperty("WEXGPUFreqMHz",active ? cagfSum*50/(3*active) : 0,64);
+   root->setProperty("WEXGPUFreqMaxMHz",cagfMax*50/3,64);
    root->setProperty("WEXGPUBusySamples",++samples,64);
   }
   lastCount=count;
