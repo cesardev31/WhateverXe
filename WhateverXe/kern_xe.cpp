@@ -15196,6 +15196,35 @@ bool XE::installTGLCSB12(KernelPatcher &patcher,size_t index,mach_vm_address_t a
   patcher.clearError();
   IORegistryEntry::getRegistryRoot()->setProperty("TGLGPGPUThreadGroupPatched",wl);
  }
+ // -wex-compute-rcs: Linux exposes no compute engine on Tiger Lake (i915 TGL
+ // platform_engine_mask is RCS0|BCS0|VECS0|VCS0|VCS2) and runs compute on RCS.
+ // The donor selects g_cInitGfxHwCtxParamsForParallelCompute (engine ID 1,
+ // ring base 0x1A000) for every Metal and CL compute context when accelerator
+ // flag bit 33 is set, which it is on 0x9A49. A reproducible Vision workload hangs
+ // there: engine 1 then resets repeatedly and WindowServer's watchdog fires.
+ // Keep the flag (engine init and memory manager also read it) and change only
+ // the two template selections to the RCS g_cInitGfxHwCtxParamsForCompute,
+ // i.e. replace each cmovae with an unconditional mov.
+ if (checkKernelArgument("-wex-compute-rcs")) {
+  struct Site {uint32_t offset; uint8_t find[11]; uint8_t replace[11];};
+  // leaq ParallelCompute + cmovaeq Compute -> leaq ParallelCompute + movq Compute; nop
+  const Site sites[] {
+   {0x28C11,{0x48,0x8D,0x35,0x74,0x7D,0x08,0x00,0x48,0x0F,0x43,0xF1},{0x48,0x8D,0x35,0x74,0x7D,0x08,0x00,0x48,0x89,0xCE,0x90}},
+   {0x2FDCA,{0x48,0x8D,0x0D,0xFB,0x0D,0x08,0x00,0x48,0x0F,0x43,0xC8},{0x48,0x8D,0x0D,0xFB,0x0D,0x08,0x00,0x48,0x89,0xC1,0x90}},
+  };
+  bool rcs=size>0x2FDD5 &&
+   patcher.solveSymbol<mach_vm_address_t>(index,"__ZN16IntelAccelerator20newCLHardwareContextEP11IGAccelTask",address,size)==address+0x28BFA &&
+   patcher.solveSymbol<mach_vm_address_t>(index,"__ZN19IGAccelCommandQueue29createHardwareContextIfNeededEh",address,size)==address+0x2FD32;
+  for (const auto &s:sites) rcs=rcs && !memcmp(reinterpret_cast<uint8_t *>(address+s.offset),s.find,sizeof(s.find));
+  for (const auto &s:sites) if (rcs) {
+   auto site=reinterpret_cast<uint8_t *>(address+s.offset);
+   KernelPatcher::LookupPatch patch {currentGraphics,s.find,s.replace,sizeof(s.find),1};
+   patcher.applyLookupPatch(&patch,site,sizeof(s.find)+1);
+   rcs=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(site,s.replace,sizeof(s.replace));
+  }
+  patcher.clearError();
+  IORegistryEntry::getRegistryRoot()->setProperty("TGLComputeOnRCSPatched",rcs);
+ }
  // The original reset writes head/tail itself before context replay. Keep those
  // stores but change their reset value, so it cannot undo initialize() above.
  const uint8_t find[] {0xB8,7,0,0,0,0x89,0x87,4,0x1C,0,0};
